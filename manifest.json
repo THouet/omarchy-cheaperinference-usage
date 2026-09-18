@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "thouet.cheaperinference-usage",
+  "name": "CheaperInference Usage",
+  "version": "1.0.0",
+  "author": "thouet",
+  "license": "MIT",
+  "description": "CheaperInference wallet balance and daily spend across all keys. Requires an API key with usage:read.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "CheaperInference Usage",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

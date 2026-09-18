@@ -1,0 +1,494 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the CheaperInference usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--period 3d|7d|1mo|3mo]
+# omarchy:hidden=true
+"""Collect wallet balance and daily usage using a CheaperInference API key.
+
+Usage endpoints (CheaperInference docs, "Usage and billing"):
+  GET /v1/usage/daily      daily spend, tokens, requests (scope usage:read)
+  GET /v1/usage/requests   paginated request history (scope usage:read)
+  GET /v1/account/balance  wallet balance (scope account:read; optional)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+import secrets
+import signal
+import stat
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "cheaperinference"
+AGENT_NAME = "CheaperInference"
+AUTH_HELP = "Set CHEAPERINFERENCE_API_KEY or add apiKey to ~/.config/omarchy/agents/cheaperinference.json. A CheaperInference API key with usage:read is required."
+BALANCE_HELP = "Balance needs a key with account:read (a usage-only key returns 403)."
+API_BASE_URL = "https://api.cheaperinference.com/v1"
+ACTIVITY_CACHE_SECONDS = 300
+VALID_PERIODS = ("3d", "7d", "1mo", "3mo")
+PERIOD_DAYS = {"3d": 3, "7d": 7, "1mo": 30, "3mo": 90}
+MAX_PRIVATE_FILE_BYTES = 512 * 1024
+MAX_HTTP_BYTES = 256 * 1024
+MAX_MODEL_NAME = 160
+MAX_RECORD_BYTES = 1024 * 1024
+COLLECT_DEADLINE_SECONDS = 25
+REQUEST_PAGE_LIMIT = 100  # API accepts 1-100
+MAX_REQUEST_PAGES = 90  # 9000 records per breakdown, plenty at these prices
+
+
+class CollectionDeadline(RuntimeError):
+  pass
+
+
+def _deadline_expired(_signum, _frame):
+  raise CollectionDeadline("collector deadline exceeded")
+
+
+def clean_text(value: Any, limit: int = 256) -> str:
+  text = str(value or "")
+  return "".join(char for char in text if char >= " " and char != "\x7f")[:limit]
+
+
+def _validate_dir(fd: int, *, private: bool = False) -> None:
+  info = os.fstat(fd)
+  if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
+    raise OSError("unsafe directory owner or type")
+  if info.st_uid == os.getuid() and info.st_mode & 0o022:
+    raise OSError("unsafe writable directory")
+  if private and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) != 0o700:
+    os.fchmod(fd, 0o700)
+
+
+def open_owned_dir(path: Path, *, create: bool = False, private: bool = False) -> int:
+  """Open an absolute directory without following any pathname component."""
+  absolute = path.expanduser()
+  if not absolute.is_absolute():
+    raise OSError("directory path must be absolute")
+  parts = absolute.parts[1:]
+  fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+  user_scope = False
+  try:
+    root_info = os.fstat(fd)
+    if root_info.st_uid != 0 or root_info.st_mode & 0o022:
+      raise OSError("unsafe filesystem root")
+    for index, part in enumerate(parts):
+      if part in ("", ".", ".."):
+        raise OSError("unsafe directory component")
+      try:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+      except FileNotFoundError:
+        if not create:
+          raise
+        os.mkdir(part, 0o700, dir_fd=fd)
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=fd)
+      os.close(fd)
+      fd = child
+      info = os.fstat(fd)
+      if info.st_uid == os.getuid():
+        user_scope = True
+      if user_scope:
+        if info.st_uid != os.getuid():
+          raise OSError("unsafe directory ownership transition")
+        _validate_dir(fd, private=private and index == len(parts) - 1)
+      elif info.st_uid != 0 or info.st_mode & 0o022:
+        raise OSError("unsafe system directory ancestor")
+      elif index == len(parts) - 1:
+        raise OSError("sensitive directory is not user-owned")
+    return fd
+  except Exception:
+    os.close(fd)
+    raise
+
+
+def read_private_json(path: Path, limit: int = MAX_PRIVATE_FILE_BYTES) -> dict[str, Any] | None:
+  try:
+    parent_fd = open_owned_dir(path.parent)
+    try:
+      fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+      try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+          return None
+        if info.st_size > limit:
+          return None
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining > 0:
+          chunk = os.read(fd, min(65536, remaining))
+          if not chunk:
+            break
+          chunks.append(chunk)
+          remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > limit:
+          return None
+        parsed = json.loads(raw.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+      finally:
+        os.close(fd)
+    finally:
+      os.close(parent_fd)
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return None
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  fd = open_owned_dir(root, create=True, private=True)
+  os.close(fd)
+  return root
+
+
+def config_path() -> Path:
+  config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+  return config_home / "omarchy" / "agents" / "cheaperinference.json"
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, round(float(value or 0)))
+  except (TypeError, ValueError):
+    return 0
+
+
+def money(value: Any) -> float:
+  try:
+    return max(0.0, float(value or 0))
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def ratio(value: Any) -> float:
+  try:
+    n = float(value or 0)
+  except (TypeError, ValueError):
+    return 0.0
+  if n > 1.0:
+    n = n / 100.0
+  return max(0.0, min(1.0, n))
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
+  try:
+    parent_fd = open_owned_dir(path.parent, private=True)
+    try:
+      fd = os.open(path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+      try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > MAX_PRIVATE_FILE_BYTES
+            or time.time() - info.st_mtime > max_age_seconds):
+          return None
+        raw = os.read(fd, MAX_PRIVATE_FILE_BYTES + 1)
+        if len(raw) > MAX_PRIVATE_FILE_BYTES:
+          return None
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+      finally:
+        os.close(fd)
+    finally:
+      os.close(parent_fd)
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return None
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+  encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+  if len(encoded) > MAX_PRIVATE_FILE_BYTES:
+    raise ValueError("cache record too large")
+  directory_fd = open_owned_dir(path.parent, create=True, private=True)
+  tmp_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+  fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+  try:
+    offset = 0
+    while offset < len(encoded):
+      offset += os.write(fd, encoded[offset:])
+    os.fsync(fd)
+    os.close(fd)
+    fd = -1
+    os.replace(tmp_name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    os.fsync(directory_fd)
+  finally:
+    if fd >= 0:
+      os.close(fd)
+    try:
+      os.unlink(tmp_name, dir_fd=directory_fd)
+    except FileNotFoundError:
+      pass
+    os.close(directory_fd)
+
+
+def read_config() -> dict[str, Any]:
+  return read_private_json(config_path(), 16 * 1024) or {}
+
+
+def api_key() -> str:
+  key = clean_text(os.environ.get("CHEAPERINFERENCE_API_KEY", ""), 512).strip()
+  if key:
+    return key
+  return clean_text(read_config().get("apiKey"), 512).strip()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+  # urllib's default handler re-sends every header — including
+  # Authorization — to whatever host a redirect names. The CheaperInference
+  # API never redirects these endpoints in normal operation, so any redirect
+  # is a reason to stop, not to follow with the key attached.
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def api_request(path: str, key: str, method: str = "GET", query: dict[str, str] | None = None) -> dict[str, Any]:
+  headers = {"Authorization": "Bearer " + key, "Accept": "application/json"}
+  url = API_BASE_URL + path
+  if query:
+    url += "?" + urllib.parse.urlencode(query)
+  request = urllib.request.Request(url, headers=headers, method=method)
+  with _opener.open(request, timeout=10) as response:
+    final = urllib.parse.urlsplit(response.geturl())
+    expected = urllib.parse.urlsplit(API_BASE_URL)
+    if final.scheme != "https" or final.hostname != expected.hostname or final.port not in (None, 443):
+      raise urllib.error.URLError("unexpected response origin")
+    raw = response.read(MAX_HTTP_BYTES + 1)
+    if len(raw) > MAX_HTTP_BYTES:
+      raise ValueError("CheaperInference response too large")
+    payload = json.loads(raw.decode("utf-8"))
+  if not isinstance(payload, dict):
+    raise ValueError("Malformed CheaperInference response")
+  return payload
+
+
+def probe_balance(key: str) -> dict[str, Any]:
+  try:
+    balance = api_request("/account/balance", key)
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      # A usage-only key cannot read the balance; that is not a setup error.
+      return {"ok": False, "forbidden": True, "helpText": BALANCE_HELP}
+    return {"ok": False, "helpText": f"CheaperInference's API returned status {error.code}. Balance unavailable."}
+  except (urllib.error.URLError, OSError, ValueError, TypeError):
+    return {
+      "ok": False,
+      "transport": True,
+      "helpText": "Couldn't reach CheaperInference. Retrying shortly. Balance unavailable.",
+    }
+  if balance.get("object") != "account.balance":
+    return {"ok": False, "helpText": "Unexpected balance response from CheaperInference."}
+  # Spend against available_usd, not balance_usd: reserved_usd is already
+  # held against unsettled requests, so the raw balance overstates spending
+  # room (CheaperInference docs, "Wallet balance").
+  result: dict[str, Any] = {
+    "ok": True,
+    "balance": {
+      "remaining": round(money(balance.get("available_usd")), 6),
+      "total": round(money(balance.get("balance_usd")), 6),
+      "reserved": round(money(balance.get("reserved_usd")), 6),
+      "funded": 0,
+      "spent": 0,
+      "currency": str(balance.get("currency") or "USD"),
+      "estimated": False,
+    },
+    "limits": [],
+    "tierLabel": "Prepaid wallet",
+  }
+  result["usageStatusText"] = ""
+  result["authHelpText"] = ""
+  return result
+
+
+def period_time_range(period: str) -> dict[str, str]:
+  days = PERIOD_DAYS.get(period, 7)
+  end = dt.datetime.now(dt.timezone.utc)
+  start = end.replace(hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(days=days - 1)
+  return {
+    "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+  }
+
+
+def daily_usage(daily_payload: dict[str, Any], time_range: dict[str, str]) -> list[dict[str, Any]]:
+  if daily_payload.get("object") != "usage.daily" or not isinstance(daily_payload.get("daily_spend"), list):
+    raise ValueError("Malformed daily usage response")
+  start = dt.date.fromisoformat(time_range["start"][:10])
+  end = dt.date.fromisoformat(time_range["end"][:10])
+  days: dict[str, dict[str, Any]] = {}
+  for offset in range((end - start).days + 1):
+    day = start + dt.timedelta(days=offset)
+    days[day.isoformat()] = {"date": day.isoformat(), "cost": 0.0, "prompts": 0, "messageCount": 0}
+  for row in daily_payload["daily_spend"]:
+    if not isinstance(row, dict):
+      raise ValueError("Malformed daily usage row")
+    day = dt.date.fromisoformat(str(row.get("date", ""))[:10]).isoformat()
+    if day not in days:
+      raise ValueError("Daily usage date outside requested window")
+    bucket = days[day]
+    bucket["cost"] += money(row.get("spend_usd"))
+    bucket["prompts"] += number(row.get("request_count"))
+    bucket["messageCount"] += number(row.get("prompt_tokens")) + number(row.get("cached_tokens"))
+  for bucket in days.values():
+    bucket["cost"] = round(bucket["cost"], 6)
+  return list(days.values())
+
+
+def ranked_spend(rows: list[dict[str, Any]], name_key: str, limit: int) -> list[dict[str, Any]]:
+  items: list[dict[str, Any]] = []
+  for row in rows:
+    label = clean_text(row.get(name_key), MAX_MODEL_NAME).strip()
+    if label == "" or label.lower() in ("null", "none", "unset", "(unset)"):
+      label = "Unknown"
+    items.append({
+      "name": label,
+      "tokens": number(row.get("total_tokens")),
+      "cost": money(row.get("billed_cost_usd")),
+    })
+  items.sort(key=lambda item: item["cost"], reverse=True)
+  return items[:limit]
+
+
+def fetch_all_requests(key: str, time_range: dict[str, str]) -> list[dict[str, Any]]:
+  """Walk every page of request history inside the period window."""
+  rows: list[dict[str, Any]] = []
+  cursor: str | None = None
+  for _ in range(MAX_REQUEST_PAGES):
+    query = {
+      "start_at": time_range["start"],
+      "end_at": time_range["end"],
+      "limit": REQUEST_PAGE_LIMIT,
+    }
+    if cursor:
+      query["cursor"] = cursor
+    payload = api_request("/usage/requests", key, query=query)
+    if payload.get("object") != "list" or not isinstance(payload.get("data"), list):
+      raise ValueError("Malformed request history response")
+    page = payload["data"]
+    if any(not isinstance(row, dict) for row in page):
+      raise ValueError("Malformed request history rows")
+    rows.extend(page)
+    if len(rows) > MAX_REQUEST_PAGES * REQUEST_PAGE_LIMIT:
+      raise ValueError("Request history exceeded collector limit")
+    if not payload.get("has_more"):
+      return rows
+    next_cursor = payload.get("next_cursor")
+    if not next_cursor or next_cursor == cursor:
+      raise ValueError("Request history pagination stalled")
+    cursor = str(next_cursor)
+  raise ValueError("Request history pagination did not finish")
+
+
+def probe_activity(key: str, period: str) -> dict[str, Any]:
+  time_range = period_time_range(period)
+  # The daily endpoint returns the whole requested range in one call,
+  # including zero-request days; it is the source of truth for totals.
+  daily_payload = api_request("/usage/daily", key, query={
+    "start_at": time_range["start"], "end_at": time_range["end"],
+  })
+  daily = daily_usage(daily_payload, time_range)
+  activity = {
+    "period": period, "source": "usage-api", "timezone": "UTC",
+    "spend": round(sum(day["cost"] for day in daily), 6),
+    "requests": sum(day["prompts"] for day in daily),
+    "tokens": sum(day["messageCount"] for day in daily),
+    "cacheHitRate": ratio(daily_payload.get("cache_hit_pct")),
+    "topModels": [], "topKeys": [], "recentDays": daily,
+    "needsApiKey": False, "breakdownErrors": {},
+  }
+  # Breakdowns come from paginated request history. A failing breakdown must
+  # not hide successfully fetched daily usage.
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    pending = {"models": pool.submit(fetch_all_requests, key, time_range),
+               "keys": pool.submit(fetch_all_requests, key, time_range)}
+    for name in ("models", "keys"):
+      try:
+        rows = pending[name].result()
+      except (urllib.error.URLError, OSError, ValueError, TypeError, KeyError):
+        activity["breakdownErrors"][name] = "Could not retrieve a complete spend breakdown. Refresh to try again."
+        continue
+      field = "model" if name == "models" else "api_key_name"
+      activity["top" + name.title()] = ranked_spend(rows, field, 1000)
+  return activity
+
+
+def collect_usage(period: str, force: bool) -> dict[str, Any]:
+  key = api_key()
+  if not key:
+    return {"usageStatusText": "API key required", "authHelpText": AUTH_HELP}
+  # Separate caches by credential and schema, so another account's totals
+  # can never satisfy this request.
+  identity = hashlib.sha256(key.encode()).hexdigest()
+  cache_file = cache_root() / f"cheaperinference-usage-v1-{identity}-{period}.json"
+  cached = read_fresh_json(cache_file, float("inf")) or {}
+  same_day = str(cached.get("fetchedAt", ""))[:10] == dt.datetime.now(dt.timezone.utc).date().isoformat()
+  if not force and same_day and time.time() - cached.get("fetchedAtSeconds", 0) < ACTIVITY_CACHE_SECONDS:
+    return cached.get("record", {})
+  try:
+    activity = probe_activity(key, period)
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      write_json(cache_file, {})
+      return {"usageStatusText": "API key rejected", "authHelpText": AUTH_HELP}
+    help_text = f"CheaperInference usage API returned status {error.code}."
+  except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError):
+    help_text = "Could not retrieve complete daily usage from CheaperInference."
+  else:
+    balance_block = probe_balance(key)
+    record = {
+      "activity": activity, "recentDays": activity["recentDays"],
+      "ready": True, "hasCostStats": True,
+      "tierLabel": "Prepaid wallet", "usageStatusText": "", "authHelpText": "",
+    }
+    if balance_block.get("ok"):
+      record["balance"] = balance_block["balance"]
+    else:
+      record["usageStatusText"] = "Balance unavailable"
+      record["authHelpText"] = balance_block["helpText"]
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_json(cache_file, {"record": record, "fetchedAt": now, "fetchedAtSeconds": time.time()})
+    return record
+  stale = dict(cached.get("record") or {})
+  stale.update({"usageStatusText": "Daily usage unavailable", "authHelpText": help_text, "retryAdvised": True})
+  if stale.get("activity"):
+    stale["authHelpText"] += " Showing cached totals from " + str(cached.get("fetchedAt", "")) + "."
+  return stale
+
+
+# -------------------------------------------------------------------- record
+
+
+def main() -> int:
+  signal.signal(signal.SIGALRM, _deadline_expired)
+  signal.alarm(COLLECT_DEADLINE_SECONDS)
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true", help="refresh account usage, ignoring caches")
+  parser.add_argument("--limits-only", action="store_true", help="reuse recent account usage when opening the panel")
+  parser.add_argument("--period", choices=list(VALID_PERIODS), default="7d", help="usage window for all tabs")
+  parser.add_argument("--cache-seconds", type=float, default=20)
+  args = parser.parse_args()
+
+  record = {
+    "schemaVersion": 1, "id": AGENT_ID, "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": False, "hasLocalStats": False, "scope": "account", "limits": [],
+  }
+  record.update(collect_usage(args.period, args.force))
+  encoded = json.dumps(record, separators=(",", ":"), sort_keys=True)
+  if len(encoded.encode("utf-8")) > MAX_RECORD_BYTES:
+    raise ValueError("collector record exceeds output limit")
+  print(encoded)
+  signal.alarm(0)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
